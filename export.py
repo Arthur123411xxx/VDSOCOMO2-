@@ -799,8 +799,6 @@ def export_bundle_zip(
             "README - Contenu du ZIP\n"
             "01_RAPPORT/rapport_complet.xlsx : rapport complet (FACTURES + LIGNES + ERREURS ...)\n"
             "02_PDF/ : PDFs classés par statut\n"
-            "03_ERREURS_PAR_PE/ : 1 dossier par PE avec PDF + fichiers d'erreurs\n"
-            "04_CSV/ : exports CSV\n"
         )
         zf.writestr("01_RAPPORT/README.txt", readme)
 
