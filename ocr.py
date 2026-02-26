@@ -1,8 +1,10 @@
 """
 ocr.py - PDF vers images, prétraitement et OCR
+Version V2: auto-retry + sélection PSM + passe dédiée chiffres (virgules)
 """
 
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import List, Tuple, Optional
@@ -13,8 +15,6 @@ from PIL import Image
 # Vérification de Tesseract
 try:
     import pytesseract
-
-    # Test si Tesseract est accessible
     pytesseract.get_tesseract_version()
     TESSERACT_AVAILABLE = True
 except Exception as e:
@@ -24,7 +24,6 @@ except Exception as e:
 # Vérification de pdf2image/poppler
 try:
     from pdf2image import convert_from_path
-
     PDF2IMAGE_AVAILABLE = True
 except Exception as e:
     PDF2IMAGE_AVAILABLE = False
@@ -33,17 +32,12 @@ except Exception as e:
 # OpenCV pour prétraitement
 try:
     import cv2
-
     CV2_AVAILABLE = True
 except ImportError:
     CV2_AVAILABLE = False
 
 
 def check_dependencies() -> Tuple[bool, List[str]]:
-    """
-    Vérifie que toutes les dépendances système sont disponibles
-    Retourne: (ok, list_of_errors)
-    """
     errors: List[str] = []
 
     if not TESSERACT_AVAILABLE:
@@ -83,41 +77,31 @@ Erreur: {PDF2IMAGE_ERROR}
     return len(errors) == 0, errors
 
 
-def preprocess_image(image: Image.Image, enhanced: bool = False) -> Image.Image:
-    """
-    Prétraitement de l'image pour améliorer l'OCR
-
-    Args:
-        image: Image PIL
-        enhanced: Si True, applique un prétraitement renforcé
-
-    Returns:
-        Image prétraitée
-    """
-    if not CV2_AVAILABLE:
-        # Sans OpenCV, conversion simple en niveaux de gris
-        return image.convert("L")
-
-    # Conversion PIL -> OpenCV
+def _pil_to_gray_cv(image: Image.Image) -> np.ndarray:
+    """PIL -> OpenCV gray."""
     img_array = np.array(image)
-
-    # Conversion en niveaux de gris si nécessaire
     if len(img_array.shape) == 3:
         gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
     else:
         gray = img_array
+    return gray
+
+
+def preprocess_image(image: Image.Image, enhanced: bool = False) -> Image.Image:
+    """
+    Prétraitement "texte" (binarisation).
+    """
+    if not CV2_AVAILABLE:
+        return image.convert("L")
+
+    gray = _pil_to_gray_cv(image)
 
     if enhanced:
-        # Prétraitement renforcé
-
-        # 1. Débruitage
         denoised = cv2.fastNlMeansDenoising(gray, h=10)
 
-        # 2. Amélioration du contraste (CLAHE)
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         contrast = clahe.apply(denoised)
 
-        # 3. Binarisation adaptative
         binary = cv2.adaptiveThreshold(
             contrast,
             255,
@@ -127,7 +111,6 @@ def preprocess_image(image: Image.Image, enhanced: bool = False) -> Image.Image:
             2,
         )
 
-        # 4. Correction de l'inclinaison (deskew)
         coords = np.column_stack(np.where(binary < 255))
         if len(coords) > 100:
             angle = cv2.minAreaRect(coords)[-1]
@@ -147,70 +130,56 @@ def preprocess_image(image: Image.Image, enhanced: bool = False) -> Image.Image:
 
         result = binary
     else:
-        # Prétraitement standard: binarisation Otsu
         _, result = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    # Conversion OpenCV -> PIL
     return Image.fromarray(result)
 
 
+def preprocess_image_numbers(image: Image.Image, scale: float = 2.0) -> Image.Image:
+    """
+    Prétraitement "chiffres": conserve le gris + upscale + sharpen.
+    Objectif: mieux garder les ponctuations petites (virgule/point).
+    """
+    if not CV2_AVAILABLE:
+        w, h = image.size
+        return image.convert("L").resize((int(w * scale), int(h * scale)))
+
+    gray = _pil_to_gray_cv(image)
+
+    gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    gray = clahe.apply(gray)
+
+    blur = cv2.GaussianBlur(gray, (0, 0), sigmaX=1.0)
+    sharp = cv2.addWeighted(gray, 1.6, blur, -0.6, 0)
+
+    sharp = cv2.bilateralFilter(sharp, d=5, sigmaColor=50, sigmaSpace=50)
+
+    return Image.fromarray(sharp)
+
+
 def pdf_to_images(pdf_path: str, dpi: int = 300) -> List[Image.Image]:
-    """
-    Convertit un PDF en liste d'images
-
-    Args:
-        pdf_path: Chemin vers le fichier PDF
-        dpi: Résolution de conversion
-
-    Returns:
-        Liste d'images PIL
-    """
     if not PDF2IMAGE_AVAILABLE:
         raise RuntimeError("pdf2image/poppler non disponible")
-
     return convert_from_path(pdf_path, dpi=dpi)
 
 
 def _safe_tesseract(image: Image.Image, lang: str, config: str) -> str:
-    """
-    OCR avec fallback automatique si une langue Tesseract n'est pas dispo.
-    """
     if not TESSERACT_AVAILABLE:
         raise RuntimeError("Tesseract non disponible")
 
-    # Tentative 1: langue demandée
     try:
         return pytesseract.image_to_string(image, lang=lang, config=config)
     except Exception:
         pass
 
-    # Tentative 2: fallback fra+eng
     try:
         return pytesseract.image_to_string(image, lang="fra+eng", config=config)
     except Exception:
         pass
 
-    # Tentative 3: fallback eng seul
     return pytesseract.image_to_string(image, lang="eng", config=config)
-
-
-def ocr_image(image: Image.Image, lang: str = "fra+eng", config: Optional[str] = None) -> str:
-    """
-    Effectue l'OCR sur une image (une seule passe).
-
-    Args:
-        image: Image PIL
-        lang: Langues Tesseract (fra+eng par défaut)
-        config: config Tesseract (par défaut optimisée factures)
-
-    Returns:
-        Texte extrait
-    """
-    if config is None:
-        # Config par défaut (factures)
-        config = r"--oem 3 --psm 6"
-
-    return _safe_tesseract(image, lang=lang, config=config)
 
 
 def ocr_best(
@@ -219,20 +188,16 @@ def ocr_best(
     configs: Optional[List[str]] = None,
 ) -> Tuple[str, dict]:
     """
-    Tente plusieurs configurations Tesseract (PSM) et garde le meilleur texte
-    selon calculate_ocr_quality().
-
-    Returns:
-        (best_text, best_quality_dict) avec best_quality_dict['tess_config'].
+    OCR "texte": essaie plusieurs PSM et garde le meilleur via calculate_ocr_quality()
     """
     from utils import calculate_ocr_quality
 
     if configs is None:
         configs = [
-            r"--oem 3 --psm 6",   # bloc de texte (défaut)
-            r"--oem 3 --psm 4",   # colonnes / blocs
-            r"--oem 3 --psm 11",  # texte épars
-            r"--oem 3 --psm 3",   # auto
+            r"--oem 3 --psm 6 -c preserve_interword_spaces=1",
+            r"--oem 3 --psm 4 -c preserve_interword_spaces=1",
+            r"--oem 3 --psm 11 -c preserve_interword_spaces=1",
+            r"--oem 3 --psm 3 -c preserve_interword_spaces=1",
         ]
 
     best_text = ""
@@ -262,41 +227,66 @@ def ocr_best(
     return best_text, best_q
 
 
+def ocr_numbers_best(
+    image: Image.Image,
+    configs: Optional[List[str]] = None,
+) -> Tuple[str, dict]:
+    """
+    OCR "chiffres": whitelist digits + ponctuation.
+    Scoring basé sur le nombre de motifs "décimaux" détectés.
+    """
+    if configs is None:
+        base = (
+            r"-c tessedit_char_whitelist=0123456789,.- "
+            r"-c classify_bln_numeric_mode=1 "
+            r"-c preserve_interword_spaces=1 "
+            r"-c load_system_dawg=0 -c load_freq_dawg=0 "
+        )
+        configs = [
+            rf"--oem 3 --psm 6 {base}",
+            rf"--oem 3 --psm 7 {base}",
+            rf"--oem 3 --psm 11 {base}",
+            rf"--oem 3 --psm 4 {base}",
+        ]
+
+    best_text = ""
+    best = {"match_count": -1, "length": 0}
+    best_cfg = configs[0]
+
+    dec_pat = re.compile(r"\b\d{1,3}(?:[ .]\d{3})*[.,]\d{1,2}\b")
+
+    for cfg in configs:
+        try:
+            txt = _safe_tesseract(image, lang="eng", config=cfg)
+        except Exception:
+            txt = ""
+
+        matches = dec_pat.findall(txt)
+        score = len(matches)
+        length = len(txt.strip())
+
+        if (score > (best.get("match_count", -1) or -1)) or (
+            score == (best.get("match_count", -1) or -1) and length > (best.get("length", 0) or 0)
+        ):
+            best_text = txt
+            best = {"match_count": score, "length": length, "matches_preview": matches[:10]}
+            best_cfg = cfg
+
+    best["tess_config"] = best_cfg
+    return best_text, best
+
+
 def process_pdf(
     pdf_path: str,
     enhanced_preprocessing: bool = False,
-    dpi: int = 300,
+    dpi: int = 350,
     lang: str = "fra+eng",
     min_quality: float = 0.6,
+    numbers_pass: bool = True,
 ) -> dict:
     """
-    Traite un PDF complet: conversion + prétraitement + OCR.
-
-    Stratégie "Option 1":
-    - Passe standard (prétraitement standard + ocr_best)
-    - Si OCR faible -> retry (prétraitement renforcé + ocr_best)
-    - Garde le meilleur résultat
-
-    Args:
-        pdf_path: Chemin vers le PDF
-        enhanced_preprocessing: Si True, force le prétraitement renforcé (pas d'auto-retry)
-        dpi: Résolution
-        lang: Langues OCR
-        min_quality: seuil de qualité pour déclencher un retry (si warning ou quality_score < min_quality)
-
-    Returns:
-        {
-            'filename': str,
-            'pages': [{
-                'page_index': int,
-                'image': Image,
-                'text': str,
-                'quality': dict
-            }],
-            'full_text': str,
-            'page_count': int,
-            'errors': list
-        }
+    - OCR texte (auto standard->enhanced si qualité faible)
+    - + OCR chiffres (virgules) en passe dédiée (optionnel)
     """
     result = {
         "filename": Path(pdf_path).name,
@@ -307,10 +297,8 @@ def process_pdf(
     }
 
     try:
-        # Conversion PDF -> images
         images = pdf_to_images(pdf_path, dpi=dpi)
         result["page_count"] = len(images)
-
         full_texts: List[str] = []
 
         for idx, img in enumerate(images):
@@ -320,16 +308,16 @@ def process_pdf(
                 "text": "",
                 "preprocessed_image": None,
                 "quality": {},
+                "numbers_text": "",
+                "numbers_quality": {},
             }
 
             try:
                 if enhanced_preprocessing:
-                    # Mode forcé: prétraitement renforcé
                     preprocessed = preprocess_image(img, enhanced=True)
                     text, quality = ocr_best(preprocessed, lang=lang)
                     quality["auto_retry_used"] = "forced_enhanced"
                 else:
-                    # Mode auto: standard puis retry si faible
                     pre_std = preprocess_image(img, enhanced=False)
                     text_std, q_std = ocr_best(pre_std, lang=lang)
 
@@ -341,7 +329,6 @@ def process_pdf(
                         pre_enh = preprocess_image(img, enhanced=True)
                         text_enh, q_enh = ocr_best(pre_enh, lang=lang)
 
-                        # Choix du meilleur résultat
                         score_std = q_std.get("quality_score", 0) or 0
                         score_enh = q_enh.get("quality_score", 0) or 0
                         len_std = q_std.get("length", 0) or 0
@@ -364,8 +351,13 @@ def process_pdf(
                 page_result["preprocessed_image"] = preprocessed
                 page_result["text"] = text
                 page_result["quality"] = quality
-
                 full_texts.append(text)
+
+                if numbers_pass:
+                    num_img = preprocess_image_numbers(img, scale=2.0)
+                    num_txt, num_q = ocr_numbers_best(num_img)
+                    page_result["numbers_text"] = num_txt
+                    page_result["numbers_quality"] = num_q
 
             except Exception as e:
                 page_result["error"] = str(e)
@@ -382,9 +374,6 @@ def process_pdf(
 
 
 def save_temp_image(image: Image.Image, prefix: str = "ocr_preview") -> str:
-    """
-    Sauvegarde une image temporaire et retourne le chemin
-    """
     temp_dir = tempfile.gettempdir()
     temp_path = os.path.join(temp_dir, f"{prefix}_{id(image)}.png")
     image.save(temp_path)

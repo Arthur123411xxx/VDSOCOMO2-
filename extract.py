@@ -2,10 +2,11 @@
 extract.py - Extraction de données des factures (PE, montants, champs bonus)
 """
 
+import re
 from typing import Optional, List
 from utils import (
     extract_pe_candidates,
-    extract_amount_candidates,
+    extract_amount_candidates,  # (plus utilisé pour le total, gardé pour compatibilité)
     extract_invoice_number,
     extract_date,
     extract_supplier,
@@ -46,30 +47,175 @@ def extract_ac_or_am(full_text: str) -> dict:
     return {"ac": "", "ac_raw": "", "ac_type": ""}
 
 
+# -----------------------------
+# Montants: extraction robuste
+# -----------------------------
+
+def normalize_amount_robust(amount_str: str) -> Optional[float]:
+    """
+    Normalise un montant en float (plus robuste que utils.normalize_amount).
+    - Accepte 1 à 3 décimales (ex: 995,904) et arrondit ensuite à 2 décimales.
+    - Supporte espaces/nbsp, séparateurs milliers (., espace) et séparateurs décimaux (, .)
+    """
+    if not amount_str:
+        return None
+
+    s = amount_str.replace("€", "").replace("EUR", "").replace("$", "")
+    s = s.replace("\u00a0", " ").strip()
+    s = re.sub(r"\s+", "", s)
+
+    if not s:
+        return None
+
+    # Si mélange , et . -> décider par la dernière occurrence (heuristique classique)
+    if "," in s and "." in s:
+        if s.rfind(",") > s.rfind("."):
+            # européen 1.234,56
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            # US 1,234.56
+            s = s.replace(",", "")
+    elif "," in s:
+        parts = s.split(",")
+        # Si 1 à 3 chiffres après la virgule -> décimal
+        if len(parts) == 2 and 1 <= len(parts[1]) <= 3:
+            s = parts[0].replace(".", "") + "." + parts[1]
+        else:
+            # sinon milliers
+            s = s.replace(",", "")
+    elif "." in s:
+        parts = s.split(".")
+        # si plusieurs points -> probablement milliers
+        if len(parts) > 2:
+            s = s.replace(".", "")
+        else:
+            # un seul point: décimal si 1 à 3 chiffres après
+            if len(parts) == 2 and 1 <= len(parts[1]) <= 3:
+                pass  # déjà ok
+            else:
+                s = s.replace(".", "")
+
+    # garder uniquement chiffres, signe et point décimal
+    s = re.sub(r"[^0-9\.-]", "", s)
+    if not s or s in (".", "-", "-.", ".-"):
+        return None
+
+    try:
+        v = float(s)
+        if v <= 0:
+            return None
+        return round(v, 2)
+    except Exception:
+        return None
+
+
+def _repair_missing_decimal_separators(line: str) -> str:
+    """
+    Répare des cas OCR fréquents où la virgule/point disparaît:
+      - "123 45" -> "123,45"
+      - "1 234 56" -> "1 234,56"
+    Uniquement si la ligne semble parler d'un montant (€, EUR, TOTAL, etc.).
+    """
+    if not line:
+        return line
+
+    low = line.lower()
+    money_context = ("€" in line) or ("eur" in low) or any(
+        kw in low for kw in ["total", "montant", "net a payer", "net à payer", "tvac", "ttc", "a payer", "à payer", "importe"]
+    )
+    if not money_context:
+        return line
+
+    def repl(m: re.Match) -> str:
+        left = m.group(1)
+        dec = m.group(2)
+        return f"{left},{dec}"
+
+    # cas avec séparateur espace: on insère une virgule avant les 2 ou 3 derniers chiffres
+    line = re.sub(r"\b(\d{1,3}(?:[ \.,]?\d{3})*|\d{1,7})\s+(\d{2,3})\b", repl, line)
+    return line
+
+
+def extract_amount_candidates_robust(text: str) -> List[dict]:
+    """
+    Extrait les montants candidats avec scoring (similaire à utils.extract_amount_candidates),
+    mais plus tolérant sur les décimales (1-3) et sur la virgule manquante.
+    """
+    candidates: List[dict] = []
+    if not text:
+        return candidates
+
+    lines = text.split("\n")
+
+    amount_patterns = [
+        r"([\d\s.,]+)\s*€",
+        r"€\s*([\d\s.,]+)",
+        r"([\d\s.,]+)\s*EUR\b",
+        r"EUR\s*([\d\s.,]+)",
+        # générique: 1 à 3 décimales
+        r"([\d]{1,3}(?:[\s.,]?\d{3})*(?:[.,]\d{1,3}))",
+    ]
+
+    priority_keywords = [
+        (1.0, ["net a payer", "net à payer", "à payer", "a payer", "grand total", "montant net"]),
+        (0.85, ["total ttc", "total tvac", "montant ttc", "total t.t.c"]),
+        (0.7, ["total général", "total general", "montant total", "total facture"]),
+        (0.5, ["total", "montant", "importe"]),
+    ]
+
+    for line_idx, raw_line in enumerate(lines):
+        line = _repair_missing_decimal_separators(raw_line)
+
+        for pattern in amount_patterns:
+            for match in re.finditer(pattern, line, re.IGNORECASE):
+                amount_str = match.group(1) if match.group(1) else match.group(0)
+                amount = normalize_amount_robust(amount_str)
+                if amount is None:
+                    continue
+
+                score = 0.3
+                keyword_found = None
+
+                # Contexte: ligne actuelle + 2 lignes avant
+                context_lines = []
+                for i in range(max(0, line_idx - 2), line_idx + 1):
+                    if i < len(lines):
+                        context_lines.append(lines[i].lower())
+                context = " ".join(context_lines)
+
+                for priority_score, keywords in priority_keywords:
+                    for kw in keywords:
+                        if kw in context:
+                            if priority_score > score:
+                                score = priority_score
+                                keyword_found = kw
+                            break
+                    if keyword_found:
+                        break
+
+                candidates.append(
+                    {
+                        "amount": amount,
+                        "raw": amount_str.strip(),
+                        "score": score,
+                        "keyword": keyword_found,
+                        "context": raw_line.strip()[:100],
+                        "line_index": line_idx,
+                    }
+                )
+
+    unique = {}
+    for c in candidates:
+        k = c["amount"]
+        if k not in unique or c["score"] > unique[k]["score"]:
+            unique[k] = c
+
+    return sorted(unique.values(), key=lambda x: x["score"], reverse=True)
+
 
 def extract_invoice_data(ocr_result: dict, include_images: bool = True) -> dict:
     """
     Extrait toutes les données d'une facture à partir du résultat OCR
-    
-    Args:
-        ocr_result: Résultat de process_pdf()
-    
-    Returns:
-        {
-            'filename': str,
-            'pe_candidates': list,
-            'pe_selected': str or None,
-            'pe_status': 'OK' | 'MANQUANT_PE' | 'MULTI_PE',
-            'amount_candidates': list,
-            'total_facture': float or None,
-            'total_status': 'OK' | 'MANQUANT_TOTAL' | 'TOTAL_AMBIGU',
-            'supplier': str or None,
-            'invoice_number': str or None,
-            'invoice_date': str or None,
-            'currency': str,
-            'warnings': list,
-            'pages_data': list
-        }
     """
     result = {
         'filename': ocr_result.get('filename', ''),
@@ -88,10 +234,10 @@ def extract_invoice_data(ocr_result: dict, include_images: bool = True) -> dict:
         'full_text': ocr_result.get('full_text', ''),
         'page_count': ocr_result.get('page_count', 0),
         'flags': [],
-
     }
-    
+
     full_text = ocr_result.get('full_text', '')
+
     acinfo = extract_ac_or_am(full_text)
     result["ac"] = acinfo["ac"]
     result["ac_raw"] = acinfo["ac_raw"]
@@ -108,10 +254,6 @@ def extract_invoice_data(ocr_result: dict, include_images: bool = True) -> dict:
             result["warnings"].append("Aucune ligne article détectée (quantités OCR = vides).")
     except Exception:
         pass
-
-
-
-
 
     # -----------------------------
     # Quantités OCR: somme par unité
@@ -139,7 +281,6 @@ def extract_invoice_data(ocr_result: dict, include_images: bool = True) -> dict:
         qty_by_unit[u] = qty_by_unit.get(u, 0.0) + qf
         qty_found += 1
 
-    # Choix d'une unité "prioritaire" (colis/boîtes d'abord)
     preferred_units = ["caja", "colis", "unidad", "kg", "pza", "pz", "unknown"]
     pick = next((uu for uu in preferred_units if uu in qty_by_unit), None)
 
@@ -163,21 +304,21 @@ def extract_invoice_data(ocr_result: dict, include_images: bool = True) -> dict:
     for page_data in ocr_result.get('pages', []):
         page_text = page_data.get('text', '')
         page_idx = page_data.get('page_index', 0)
-        
+
         candidates = extract_pe_candidates(page_text)
         for c in candidates:
             c['page_index'] = page_idx
         pe_candidates.extend(candidates)
-    
+
     # Dédupliquer par PE, garder le meilleur score
     unique_pe = {}
     for c in pe_candidates:
         pe = c['pe']
         if pe not in unique_pe or c['score'] > unique_pe[pe]['score']:
             unique_pe[pe] = c
-    
+
     result['pe_candidates'] = list(unique_pe.values())
-    
+
     # Sélection automatique du PE
     if len(result['pe_candidates']) == 0:
         result['pe_status'] = 'MANQUANT_PE'
@@ -186,25 +327,32 @@ def extract_invoice_data(ocr_result: dict, include_images: bool = True) -> dict:
         result['pe_selected'] = result['pe_candidates'][0]['pe']
         result['pe_status'] = 'OK'
     else:
-        # Plusieurs PE: prendre le meilleur score
         result['pe_candidates'].sort(key=lambda x: x['score'], reverse=True)
         result['pe_selected'] = result['pe_candidates'][0]['pe']
         result['pe_status'] = 'MULTI_PE'
         result['warnings'].append(f"Plusieurs PE détectés: {[c['pe'] for c in result['pe_candidates']]}")
-    
-    # Extraction montants
-    amount_candidates = extract_amount_candidates(full_text)
+
+    # Extraction montants (robuste)
+    amount_candidates = extract_amount_candidates_robust(full_text)
+
+    # Fallback: si rien trouvé, tenter sur la passe "numbers_text" (si disponible)
+    if len(amount_candidates) == 0:
+        numbers_text = "\n".join((p.get("numbers_text") or "") for p in ocr_result.get("pages", []))
+        if numbers_text.strip():
+            amount_candidates = extract_amount_candidates_robust(numbers_text)
+            if len(amount_candidates) > 0:
+                result["flags"].append("TOTAL_VIA_NUMBERS_PASS")
+                result["warnings"].append("Total détecté via passe chiffres (virgules).")
+
     result['amount_candidates'] = amount_candidates
-    
+
     if len(amount_candidates) == 0:
         result['total_status'] = 'MANQUANT_TOTAL'
         result['warnings'].append('Aucun montant détecté')
     else:
-        # Sélection du meilleur montant
         best = amount_candidates[0]
         result['total_facture'] = best['amount']
-        
-        # Vérifier si ambigu (plusieurs montants avec scores similaires)
+
         if len(amount_candidates) > 1:
             second_best = amount_candidates[1]
             if second_best['score'] >= 0.7 * best['score'] and second_best['amount'] != best['amount']:
@@ -216,13 +364,13 @@ def extract_invoice_data(ocr_result: dict, include_images: bool = True) -> dict:
                 result['total_status'] = 'OK'
         else:
             result['total_status'] = 'OK'
-    
+
     # Champs bonus
     result['supplier'] = extract_supplier(full_text)
     result['invoice_number'] = extract_invoice_number(full_text)
     result['invoice_date'] = extract_date(full_text)
     result['currency'] = detect_currency(full_text)
-    
+
     # Données par page (pour l'UI)
     for page_data in ocr_result.get('pages', []):
         page_idx = page_data.get('page_index', 0)
@@ -230,46 +378,38 @@ def extract_invoice_data(ocr_result: dict, include_images: bool = True) -> dict:
             'page_index': page_idx,
             'text': page_data.get('text', ''),
             'quality': page_data.get('quality', {}),
+            'numbers_text': page_data.get('numbers_text', ''),
+            'numbers_quality': page_data.get('numbers_quality', {}),
             'image': page_data.get('image') if include_images else None,
             'preprocessed_image': page_data.get('preprocessed_image') if include_images else None,
             'pe_on_page': [c for c in result['pe_candidates'] if c.get('page_index') == page_idx]
         })
-    
+
     return result
 
 
-def apply_manual_correction(invoice_data: dict, 
+def apply_manual_correction(invoice_data: dict,
                            pe_correction: Optional[str] = None,
                            amount_correction: Optional[float] = None) -> dict:
     """
     Applique des corrections manuelles sur les données extraites
-    
-    Args:
-        invoice_data: Données extraites
-        pe_correction: Nouveau PE (si correction)
-        amount_correction: Nouveau montant (si correction)
-    
-    Returns:
-        Données mises à jour
     """
     result = invoice_data.copy()
-    
+
     if pe_correction is not None:
         normalized_pe = normalize_pe(pe_correction)
         if normalized_pe:
             result['pe_selected'] = normalized_pe
             result['pe_status'] = 'OK'
             result['pe_manual'] = True
-            # Retirer le warning PE si présent
             result['warnings'] = [w for w in result['warnings'] if 'PE' not in w.upper()]
-    
+
     if amount_correction is not None:
         result['total_facture'] = round(amount_correction, 2)
         result['total_status'] = 'OK'
         result['amount_manual'] = True
-        # Retirer le warning montant si présent
         result['warnings'] = [w for w in result['warnings'] if 'montant' not in w.lower() and 'AMBIGU' not in w]
-    
+
     return result
 
 
@@ -293,8 +433,6 @@ def summarize_extraction(invoice_data: dict) -> dict:
     }
 
 
-import re
-
 def extract_item_lines(full_text: str, max_items: int = 50) -> dict:
     """
     Extrait toutes les lignes articles.
@@ -303,18 +441,13 @@ def extract_item_lines(full_text: str, max_items: int = 50) -> dict:
     t = (full_text or "").replace("\r", "\n")
     lines = [ln.strip() for ln in t.split("\n") if ln.strip()]
 
-    def to_float_fr(x: str) -> float:
-        return float(x.replace(".", "").replace(",", "."))
-
     items = []
     for ln in lines:
-        # Heuristique: une ligne article commence par un code produit (tolérant espaces / pas de |)
         if not re.search(r"^\s*\d{3,}\b", ln):
             continue
 
         flat = re.sub(r"\s+", " ", ln.replace("|", " ")).strip()
 
-        # code
         mcode = re.match(r"^(\d{3,})\b", flat)
         if not mcode:
             continue
@@ -338,7 +471,6 @@ def extract_item_lines(full_text: str, max_items: int = 50) -> dict:
 
             unit = mqty.group(2).lower().strip()
 
-            # Normalisation unités
             if unit == "cajas":
                 unit = "caja"
             if unit in ("ud", "uds"):
@@ -348,9 +480,8 @@ def extract_item_lines(full_text: str, max_items: int = 50) -> dict:
             if unit in ("kilos", "kilo"):
                 unit = "kg"
             if unit == "colis":
-                unit = "caja"  # si tu veux aligner "colis" avec caja
+                unit = "caja"
 
-        # unités détail (ex: 1.248,000 Unidades)
         munits = re.search(
             r"\b(\d[\d\.,]*)(?:\s+)(unidades|kilos|kilo|kg)\b",
             flat,
@@ -364,47 +495,31 @@ def extract_item_lines(full_text: str, max_items: int = 50) -> dict:
             raw_num = munits.group(1)
             units_detail_uom = munits.group(2).lower()
 
-            # conversion robuste: garde le dernier séparateur comme décimal si cohérent,
-            # sinon interprète comme milliers
             s = raw_num.replace(" ", "").replace("\u00a0", "")
 
-            # Cas "2,664,000" (OCR) -> 2664.000 ou 2664000 selon contexte.
-            # Ici avec "Kilos", c'est très probablement 2664.000 (car total 2.813.184 ~ 2813.184)
             if s.count(",") >= 2 and "." not in s:
-                # interprète dernière virgule comme décimale, les autres comme milliers
                 parts = s.split(",")
                 s = "".join(parts[:-1]) + "." + parts[-1]
                 units_detail = float(s)
             else:
-                # fallback général: supprime milliers, garde décimales
-                # ex: "1.248,000" -> 1248.000 ; "2.813.184" -> 2813184 (si pas de virgule)
                 if "," in s and "." in s:
-                    # suppose '.' milliers et ',' décimal
                     units_detail = float(s.replace(".", "").replace(",", "."))
                 elif "," in s:
-                    # suppose ',' décimal
                     units_detail = float(s.replace(".", "").replace(",", "."))
                 else:
-                    # que des points -> milliers
                     units_detail = float(s.replace(".", ""))
 
-        # ✅ retire "1.248,000 Unidades" avant de chercher PU et Total
         flat_no_units = re.sub(r"\b\d[\d\.]*,\d+\s+unidades\b", " ", flat, flags=re.IGNORECASE)
         flat_no_units = re.sub(r"\s+", " ", flat_no_units).strip()
 
-        # prix unit + total ligne = 2 derniers décimaux
         def parse_num(s: str) -> float:
             s = s.replace("€", "").replace(" ", "").replace("\u00a0", "")
-            # cas 1: "1.234,56" -> 1234.56
             if "," in s and "." in s:
                 return float(s.replace(".", "").replace(",", "."))
-            # cas 2: "1,234" -> 1.234
             if "," in s:
                 return float(s.replace(".", "").replace(",", "."))
-            # cas 3: "7.824.960" -> 7824960
             if s.count(".") >= 2:
                 return float(s.replace(".", ""))
-            # cas 4: "37.225" -> 37225 (souvent milliers)
             if s.count(".") == 1 and len(s.split(".")[-1]) == 3:
                 return float(s.replace(".", ""))
             return float(s)
@@ -418,7 +533,6 @@ def extract_item_lines(full_text: str, max_items: int = 50) -> dict:
             except Exception:
                 unit_price = line_total = None
 
-        # description: texte entre code et quantité (si quantité trouvée)
         description = None
         if qty is not None and unit is not None:
             tmp = re.sub(r"^\d{3,}\s*", "", flat).strip()
@@ -428,7 +542,7 @@ def extract_item_lines(full_text: str, max_items: int = 50) -> dict:
             description = re.sub(r"^\d{3,}\s*", "", flat).strip()
 
         ok = bool(code and qty is not None and unit_price is not None and line_total is not None)
-        # On garde même si ok=False, utile pour debug
+
         items.append({
             "ok": ok,
             "item_code": code,
@@ -445,7 +559,6 @@ def extract_item_lines(full_text: str, max_items: int = 50) -> dict:
         if len(items) >= max_items:
             break
 
-    # somme des lignes (uniquement celles ok)
     sum_lines = sum(it["line_total"] for it in items if it.get("ok") and isinstance(it.get("line_total"), float))
 
     return {
